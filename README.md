@@ -10,12 +10,14 @@ OpenAI-compatible image generation proxy for Black Forest Labs FLUX.2 models.
 | `BFL_BASE_URL` | No | `https://api.eu.bfl.ai/v1` | BFL API base URL |
 | `PROXY_PORT` | No | `8765` | Proxy listen port |
 
-## Deploy via Quadlet (Rootful)
+## Build & Run (Podman)
 
 ```bash
-sudo cp bfl-proxy.container /etc/containers/systemd/
-sudo systemctl daemon-reload
-sudo systemctl start bfl-proxy
+podman build -t bfl-proxy:latest .
+podman run -d --name bfl-proxy -p 8765:8765 \
+  -e BFL_API_KEY=your_key \
+  -e BFL_BASE_URL=https://api.eu.bfl.ai/v1 \
+  bfl-proxy:latest
 ```
 
 ## OpenWebUI Settings
