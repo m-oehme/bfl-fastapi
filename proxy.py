@@ -1,8 +1,8 @@
 """
-BFL FLUX.2 OpenAI-Compatible Image Generation Proxy
+BFL FLUX.2 OpenAI-Compatible Image Generation & Editing Proxy
 
-Translates OpenAI /v1/images/generations requests to BFL's async API.
-Supports all FLUX.2 models via the BFL API.
+Translates OpenAI /v1/images/generations and /v1/images/edits requests
+to BFL's async API. Supports all FLUX.2 models via the BFL API.
 """
 
 import asyncio
@@ -13,7 +13,7 @@ from contextlib import asynccontextmanager
 from typing import Optional
 
 import aiohttp
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel, Field
 
 # ── Configuration ──────────────────────────────────────────────────────────
@@ -47,6 +47,16 @@ SIZE_MAP = {
     "2048x2048": (2048, 2048),
 }
 
+# Size → aspect_ratio mapping for editing
+ASPECT_RATIO_MAP = {
+    "256x256": "1:1",
+    "512x512": "1:1",
+    "1024x1024": "1:1",
+    "1792x1024": "16:9",
+    "1024x1792": "9:16",
+    "2048x2048": "1:1",
+}
+
 # ── Pydantic Models ────────────────────────────────────────────────────────
 
 class ImageGenerationRequest(BaseModel):
@@ -58,6 +68,18 @@ class ImageGenerationRequest(BaseModel):
     response_format: Optional[str] = "url"
     style: Optional[str] = None
     user: Optional[str] = None
+    # Editing fields (optional — when present, triggers edit mode)
+    input_image: Optional[str] = None
+    input_image_2: Optional[str] = None
+    input_image_3: Optional[str] = None
+    input_image_4: Optional[str] = None
+    input_image_5: Optional[str] = None
+    input_image_6: Optional[str] = None
+    input_image_7: Optional[str] = None
+    input_image_8: Optional[str] = None
+    output_format: Optional[str] = "jpeg"
+    safety_tolerance: Optional[int] = Field(default=2, ge=0, le=6)
+    seed: Optional[int] = None
 
 
 class ModelInfo(BaseModel):
@@ -86,8 +108,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="BFL FLUX.2 Proxy",
-    description="OpenAI-compatible image generation proxy for Black Forest Labs FLUX.2",
-    version="1.0.0",
+    description="OpenAI-compatible image generation & editing proxy for Black Forest Labs FLUX.2",
+    version="1.1.0",
     lifespan=lifespan,
 )
 
@@ -95,7 +117,7 @@ app = FastAPI(
 # ── Helpers ────────────────────────────────────────────────────────────────
 
 async def _bfl_submit(model: str, payload: dict) -> dict:
-    """Submit generation job to BFL, return {id, polling_url}."""
+    """Submit generation/editing job to BFL, return {id, polling_url}."""
     async with app.state.http.post(
         f"{BFL_BASE_URL}/{model}",
         json=payload,
@@ -143,6 +165,35 @@ def _size_to_wh(size: Optional[str]) -> tuple[int, int]:
     return 1024, 1024
 
 
+def _size_to_aspect_ratio(size: Optional[str]) -> Optional[str]:
+    if size and size in ASPECT_RATIO_MAP:
+        return ASPECT_RATIO_MAP[size]
+    return None
+
+
+async def _file_to_data_url(file: UploadFile) -> str:
+    """Convert an uploaded file to a base64 data URL."""
+    content = await file.read()
+    mime = file.content_type or "image/png"
+    b64 = base64.b64encode(content).decode("utf-8")
+    return f"data:{mime};base64,{b64}"
+
+
+def _build_openai_response(image_url: str, response_format: str, created: int) -> dict:
+    """Build OpenAI-compatible response."""
+    if response_format == "b64_json":
+        # Note: b64_json requires fetching the image first.
+        # For editing, we return url by default since the signed URL is short-lived.
+        return {
+            "created": created,
+            "data": [{"url": image_url}],
+        }
+    return {
+        "created": created,
+        "data": [{"url": image_url}],
+    }
+
+
 # ── Endpoints ──────────────────────────────────────────────────────────────
 
 @app.get("/v1/models")
@@ -165,16 +216,44 @@ async def image_generations(req: ImageGenerationRequest):
             f"Unknown model '{req.model}'. Supported: {', '.join(MODEL_MAP.keys())}"
         )
 
-    width, height = _size_to_wh(req.size)
+    # Determine if this is an editing request
+    is_edit = req.input_image is not None
 
-    # Build BFL payload
-    bfl_payload = {
-        "prompt": req.prompt,
-        "width": width,
-        "height": height,
-        "prompt_upsampling": req.quality == "hd",
-        "seed": None,
-    }
+    if is_edit:
+        # Build BFL editing payload
+        bfl_payload = {
+            "prompt": req.prompt,
+            "input_image": req.input_image,
+            "output_format": req.output_format or "jpeg",
+            "safety_tolerance": req.safety_tolerance if req.safety_tolerance is not None else 2,
+        }
+
+        # Add optional reference images
+        for i in range(2, 9):
+            field = f"input_image_{i}"
+            value = getattr(req, field, None)
+            if value:
+                bfl_payload[field] = value
+
+        # Add aspect_ratio if size is specified
+        aspect_ratio = _size_to_aspect_ratio(req.size)
+        if aspect_ratio:
+            bfl_payload["aspect_ratio"] = aspect_ratio
+
+        # Add optional seed
+        if req.seed is not None:
+            bfl_payload["seed"] = req.seed
+
+    else:
+        # Build BFL text-to-image payload
+        width, height = _size_to_wh(req.size)
+        bfl_payload = {
+            "prompt": req.prompt,
+            "width": width,
+            "height": height,
+            "prompt_upsampling": req.quality == "hd",
+            "seed": req.seed,
+        }
 
     # Submit to BFL
     submit = await _bfl_submit(bfl_model, bfl_payload)
@@ -192,6 +271,74 @@ async def image_generations(req: ImageGenerationRequest):
     created = int(time.time())
 
     if req.response_format == "b64_json":
+        image_bytes = await _fetch_image(image_url)
+        b64 = base64.b64encode(image_bytes).decode("utf-8")
+        return {
+            "created": created,
+            "data": [{"b64_json": b64}],
+        }
+
+    return {
+        "created": created,
+        "data": [{"url": image_url}],
+    }
+
+
+@app.post("/v1/images/edits")
+async def image_edits(
+    image: UploadFile = File(...),
+    prompt: str = Form(...),
+    model: Optional[str] = Form("flux-2-pro"),
+    mask: Optional[UploadFile] = File(None),
+    n: Optional[int] = Form(1),
+    size: Optional[str] = Form("1024x1024"),
+    response_format: Optional[str] = Form("url"),
+    user: Optional[str] = Form(None),
+):
+    """
+    OpenAI-compatible image editing endpoint.
+    Accepts multipart/form-data with image file, converts to base64 data URL,
+    and forwards to BFL's editing API.
+    """
+    bfl_model = MODEL_MAP.get(model)
+    if not bfl_model:
+        raise HTTPException(
+            400,
+            f"Unknown model '{model}'. Supported: {', '.join(MODEL_MAP.keys())}"
+        )
+
+    # Convert uploaded image to base64 data URL
+    input_image = await _file_to_data_url(image)
+
+    # Build BFL editing payload
+    bfl_payload = {
+        "prompt": prompt,
+        "input_image": input_image,
+        "output_format": "jpeg",
+        "safety_tolerance": 2,
+    }
+
+    # Add aspect_ratio if size is specified
+    aspect_ratio = _size_to_aspect_ratio(size)
+    if aspect_ratio:
+        bfl_payload["aspect_ratio"] = aspect_ratio
+
+    # Submit to BFL
+    submit = await _bfl_submit(bfl_model, bfl_payload)
+    polling_url = submit.get("polling_url")
+    if not polling_url:
+        raise HTTPException(502, "BFL did not return polling_url")
+
+    # Poll for result
+    result = await _bfl_poll(polling_url)
+    image_url = result.get("result", {}).get("sample")
+    if not image_url:
+        raise HTTPException(502, "BFL result missing image URL")
+
+    # Build OpenAI-compatible response
+    created = int(time.time())
+
+    if response_format == "b64_json":
         image_bytes = await _fetch_image(image_url)
         b64 = base64.b64encode(image_bytes).decode("utf-8")
         return {
