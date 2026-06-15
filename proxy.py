@@ -123,7 +123,7 @@ async def _bfl_poll(polling_url: str, max_wait: float = 120.0) -> dict:
             status = data.get("status")
             if status == "Ready":
                 return data
-            if status == "Error":
+            if status in ("Error", "Failed"):
                 raise HTTPException(502, f"BFL generation failed: {data}")
         await asyncio.sleep(0.5)
     raise HTTPException(504, "BFL generation timed out")
@@ -184,7 +184,7 @@ async def image_generations(req: ImageGenerationRequest):
 
     # Poll for result
     result = await _bfl_poll(polling_url)
-    image_url = result.get("sample")
+    image_url = result.get("result", {}).get("sample")
     if not image_url:
         raise HTTPException(502, "BFL result missing image URL")
 
