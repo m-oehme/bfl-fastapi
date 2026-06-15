@@ -1,8 +1,9 @@
 """
-BFL FLUX.2 OpenAI-Compatible Image Generation & Editing Proxy
+BFL FLUX.2 OpenAI-Compatible Image Generation, Editing & Variations Proxy
 
-Translates OpenAI /v1/images/generations and /v1/images/edits requests
-to BFL's async API. Supports all FLUX.2 models via the BFL API.
+Translates OpenAI /v1/images/generations, /v1/images/edits and
+/v1/images/variations requests to BFL's async API.
+Supports all FLUX.2 models via the BFL API.
 """
 
 import asyncio
@@ -21,6 +22,12 @@ from pydantic import BaseModel, Field
 BFL_API_KEY = os.environ["BFL_API_KEY"]
 BFL_BASE_URL = os.environ.get("BFL_BASE_URL", "https://api.eu.bfl.ai/v1").rstrip("/")
 PROXY_PORT = int(os.environ.get("PROXY_PORT", "8765"))
+
+# Default prompt used for /v1/images/variations when no prompt is provided
+DEFAULT_VARIATION_PROMPT = os.environ.get(
+    "BFL_VARIATION_PROMPT",
+    "Create a creative variation of this image, keeping the same subject and style but with subtle differences in composition, lighting, and details."
+)
 
 # Map OpenAI model names → BFL endpoint paths
 MODEL_MAP = {
@@ -108,8 +115,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="BFL FLUX.2 Proxy",
-    description="OpenAI-compatible image generation & editing proxy for Black Forest Labs FLUX.2",
-    version="1.1.0",
+    description="OpenAI-compatible image generation, editing & variations proxy for Black Forest Labs FLUX.2",
+    version="1.2.0",
     lifespan=lifespan,
 )
 
@@ -313,6 +320,76 @@ async def image_edits(
     # Build BFL editing payload
     bfl_payload = {
         "prompt": prompt,
+        "input_image": input_image,
+        "output_format": "jpeg",
+        "safety_tolerance": 2,
+    }
+
+    # Add aspect_ratio if size is specified
+    aspect_ratio = _size_to_aspect_ratio(size)
+    if aspect_ratio:
+        bfl_payload["aspect_ratio"] = aspect_ratio
+
+    # Submit to BFL
+    submit = await _bfl_submit(bfl_model, bfl_payload)
+    polling_url = submit.get("polling_url")
+    if not polling_url:
+        raise HTTPException(502, "BFL did not return polling_url")
+
+    # Poll for result
+    result = await _bfl_poll(polling_url)
+    image_url = result.get("result", {}).get("sample")
+    if not image_url:
+        raise HTTPException(502, "BFL result missing image URL")
+
+    # Build OpenAI-compatible response
+    created = int(time.time())
+
+    if response_format == "b64_json":
+        image_bytes = await _fetch_image(image_url)
+        b64 = base64.b64encode(image_bytes).decode("utf-8")
+        return {
+            "created": created,
+            "data": [{"b64_json": b64}],
+        }
+
+    return {
+        "created": created,
+        "data": [{"url": image_url}],
+    }
+
+
+@app.post("/v1/images/variations")
+async def image_variations(
+    image: UploadFile = File(...),
+    model: Optional[str] = Form("flux-2-pro"),
+    n: Optional[int] = Form(1),
+    size: Optional[str] = Form("1024x1024"),
+    response_format: Optional[str] = Form("url"),
+    user: Optional[str] = Form(None),
+):
+    """
+    OpenAI-compatible image variations endpoint.
+    Accepts multipart/form-data with image file, converts to base64 data URL,
+    and forwards to BFL's editing API with a default variation prompt.
+    
+    Note: BFL does not have a native variations endpoint. This is approximated
+    by using the editing API with a prompt that asks for creative variations.
+    The prompt can be customized via the BFL_VARIATION_PROMPT env var.
+    """
+    bfl_model = MODEL_MAP.get(model)
+    if not bfl_model:
+        raise HTTPException(
+            400,
+            f"Unknown model '{model}'. Supported: {', '.join(MODEL_MAP.keys())}"
+        )
+
+    # Convert uploaded image to base64 data URL
+    input_image = await _file_to_data_url(image)
+
+    # Build BFL editing payload with variation prompt
+    bfl_payload = {
+        "prompt": DEFAULT_VARIATION_PROMPT,
         "input_image": input_image,
         "output_format": "jpeg",
         "safety_tolerance": 2,
