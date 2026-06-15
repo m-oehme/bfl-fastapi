@@ -15,7 +15,7 @@ from contextlib import asynccontextmanager
 from typing import Optional
 
 import aiohttp
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field
 
 # ── Configuration ──────────────────────────────────────────────────────────
@@ -117,7 +117,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="BFL FLUX.2 Proxy",
     description="OpenAI-compatible image generation, editing & variations proxy for Black Forest Labs FLUX.2",
-    version="1.2.1",
+    version="1.2.2",
     lifespan=lifespan,
 )
 
@@ -179,8 +179,8 @@ def _size_to_aspect_ratio(size: Optional[str]) -> Optional[str]:
     return None
 
 
-async def _file_to_base64(file: UploadFile) -> str:
-    """Convert an uploaded file to raw base64 string (BFL native format)."""
+async def _uploadfile_to_base64(file) -> str:
+    """Convert an uploaded file (starlette UploadFile) to raw base64 string."""
     content = await file.read()
     return base64.b64encode(content).decode("utf-8")
 
@@ -189,7 +189,6 @@ def _strip_data_url_prefix(value: Optional[str]) -> Optional[str]:
     """Strip data:image/...;base64, prefix if present, returning raw base64."""
     if not value:
         return value
-    # Match data:image/<type>;base64,<data> or data:application/octet-stream;base64,<data>
     match = re.match(r"^data:[^;]+;base64,(.+)$", value)
     if match:
         return match.group(1)
@@ -199,8 +198,6 @@ def _strip_data_url_prefix(value: Optional[str]) -> Optional[str]:
 def _build_openai_response(image_url: str, response_format: str, created: int) -> dict:
     """Build OpenAI-compatible response."""
     if response_format == "b64_json":
-        # Note: b64_json requires fetching the image first.
-        # For editing, we return url by default since the signed URL is short-lived.
         return {
             "created": created,
             "data": [{"url": image_url}],
@@ -238,7 +235,6 @@ async def image_generations(req: ImageGenerationRequest):
 
     if is_edit:
         # Build BFL editing payload
-        # Strip data URL prefix if present — BFL expects raw base64
         bfl_payload = {
             "prompt": req.prompt,
             "input_image": _strip_data_url_prefix(req.input_image),
@@ -246,19 +242,17 @@ async def image_generations(req: ImageGenerationRequest):
             "safety_tolerance": req.safety_tolerance if req.safety_tolerance is not None else 2,
         }
 
-        # Add optional reference images (also strip data URL prefixes)
+        # Add optional reference images
         for i in range(2, 9):
             field = f"input_image_{i}"
             value = getattr(req, field, None)
             if value:
                 bfl_payload[field] = _strip_data_url_prefix(value)
 
-        # Add aspect_ratio if size is specified
         aspect_ratio = _size_to_aspect_ratio(req.size)
         if aspect_ratio:
             bfl_payload["aspect_ratio"] = aspect_ratio
 
-        # Add optional seed
         if req.seed is not None:
             bfl_payload["seed"] = req.seed
 
@@ -303,21 +297,38 @@ async def image_generations(req: ImageGenerationRequest):
 
 
 @app.post("/v1/images/edits")
-async def image_edits(
-    image: UploadFile = File(...),
-    prompt: str = Form(...),
-    model: Optional[str] = Form("flux-2-pro"),
-    mask: Optional[UploadFile] = File(None),
-    n: Optional[int] = Form(1),
-    size: Optional[str] = Form("1024x1024"),
-    response_format: Optional[str] = Form("url"),
-    user: Optional[str] = Form(None),
-):
+async def image_edits(request: Request):
     """
     OpenAI-compatible image editing endpoint.
-    Accepts multipart/form-data with image file, converts to raw base64,
-    and forwards to BFL's editing API.
+    Accepts multipart/form-data with image file(s).
+    Supports both 'image' and 'image[]' field names (OpenWebUI sends 'image[]').
+    Converts uploaded file to raw base64 and forwards to BFL's editing API.
     """
+    form = await request.form()
+
+    # Find the first image file — OpenWebUI sends 'image[]', but also accept 'image'
+    image_file = None
+    for key in ("image", "image[]"):
+        files = form.getlist(key)
+        for f in files:
+            if hasattr(f, "read"):  # starlette UploadFile
+                image_file = f
+                break
+        if image_file:
+            break
+
+    if not image_file:
+        raise HTTPException(400, "No image file found in request. Expected 'image' or 'image[]' field.")
+
+    # Extract other form fields
+    prompt = form.get("prompt", "")
+    if not prompt:
+        raise HTTPException(400, "Missing required field: prompt")
+
+    model = form.get("model", "flux-2-pro")
+    size = form.get("size", "1024x1024")
+    response_format = form.get("response_format", "url")
+
     bfl_model = MODEL_MAP.get(model)
     if not bfl_model:
         raise HTTPException(
@@ -326,7 +337,7 @@ async def image_edits(
         )
 
     # Convert uploaded image to raw base64 (BFL native format)
-    input_image = await _file_to_base64(image)
+    input_image = await _uploadfile_to_base64(image_file)
 
     # Build BFL editing payload
     bfl_payload = {
@@ -371,23 +382,34 @@ async def image_edits(
 
 
 @app.post("/v1/images/variations")
-async def image_variations(
-    image: UploadFile = File(...),
-    model: Optional[str] = Form("flux-2-pro"),
-    n: Optional[int] = Form(1),
-    size: Optional[str] = Form("1024x1024"),
-    response_format: Optional[str] = Form("url"),
-    user: Optional[str] = Form(None),
-):
+async def image_variations(request: Request):
     """
     OpenAI-compatible image variations endpoint.
-    Accepts multipart/form-data with image file, converts to raw base64,
-    and forwards to BFL's editing API with a default variation prompt.
-
-    Note: BFL does not have a native variations endpoint. This is approximated
-    by using the editing API with a prompt that asks for creative variations.
-    The prompt can be customized via the BFL_VARIATION_PROMPT env var.
+    Accepts multipart/form-data with image file(s).
+    Supports both 'image' and 'image[]' field names (OpenWebUI sends 'image[]').
+    Converts uploaded file to raw base64 and forwards to BFL's editing API.
     """
+    form = await request.form()
+
+    # Find the first image file — OpenWebUI sends 'image[]', but also accept 'image'
+    image_file = None
+    for key in ("image", "image[]"):
+        files = form.getlist(key)
+        for f in files:
+            if hasattr(f, "read"):  # starlette UploadFile
+                image_file = f
+                break
+        if image_file:
+            break
+
+    if not image_file:
+        raise HTTPException(400, "No image file found in request. Expected 'image' or 'image[]' field.")
+
+    # Extract other form fields
+    model = form.get("model", "flux-2-pro")
+    size = form.get("size", "1024x1024")
+    response_format = form.get("response_format", "url")
+
     bfl_model = MODEL_MAP.get(model)
     if not bfl_model:
         raise HTTPException(
@@ -396,7 +418,7 @@ async def image_variations(
         )
 
     # Convert uploaded image to raw base64 (BFL native format)
-    input_image = await _file_to_base64(image)
+    input_image = await _uploadfile_to_base64(image_file)
 
     # Build BFL editing payload with variation prompt
     bfl_payload = {
