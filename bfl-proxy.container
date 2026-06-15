@@ -1,0 +1,13 @@
+[Container]
+Image=localhost/bfl-proxy:latest
+ContainerName=bfl-proxy
+PublishPort=8765:8765
+Environment=BFL_API_KEY=${BFL_API_KEY}
+Environment=BFL_BASE_URL=${BFL_BASE_URL}
+Environment=PROXY_PORT=8765
+
+[Service]
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
